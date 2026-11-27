@@ -51,6 +51,10 @@ public sealed class PolygonStroker
     private ArrayBuilder<Vertex> outVertices = new(1);
     private ArrayBuilder<StrokeVertexDistance> srcVertices = new(16);
 
+    // The vertices of the stroke contour that FinishPath is building. The stroker reuses this buffer for every contour,
+    // so a contour is copied once into an array of its exact length instead of growing a list by doubling.
+    private ArrayBuilder<Vertex> contourVertices = new(16);
+
     // Streaming-state fields used by the Accumulate() state machine.
     private int closed;
     private int outVertex;
@@ -479,7 +483,7 @@ public sealed class PolygonStroker
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int GetRetainedScratchBytes()
-        => (this.outVertices.Capacity * Unsafe.SizeOf<Vertex>()) +
+        => ((this.outVertices.Capacity + this.contourVertices.Capacity) * Unsafe.SizeOf<Vertex>()) +
            (this.srcVertices.Capacity * Unsafe.SizeOf<StrokeVertexDistance>());
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -487,6 +491,7 @@ public sealed class PolygonStroker
     {
         this.outVertices.Clear();
         this.srcVertices.Clear();
+        this.contourVertices.Clear();
         this.closed = 0;
         this.outVertex = 0;
         this.prevStatus = Status.Initial;
@@ -526,7 +531,9 @@ public sealed class PolygonStroker
         Vertex current = default;
         Vertex lastPoint = default;
         bool hasLastPoint = false;
-        Contour? currentContour = null;
+        bool hasContour = false;
+        ref ArrayBuilder<Vertex> points = ref this.contourVertices;
+        points.Clear();
         PathCommand command;
 
         while (!(command = this.Accumulate(ref current)).Stop())
@@ -534,23 +541,19 @@ public sealed class PolygonStroker
             if (command.MoveTo())
             {
                 // Start a new contour. Commit any previous contour that is already complete.
-                if (currentContour is { Count: >= 3 })
+                if (hasContour && points.Length >= 3)
                 {
-                    AddStrokeContour(result, currentContour);
+                    AddStrokeContour(result, points.AsSpan());
                 }
 
-                // Each closed side visits the source once. An open outline visits
-                // both sides in one contour. Closure adds no repeated vertex here.
-                // Match the list's doubling sizes so extra join vertices do not
-                // overshoot the capacity that ordinary list growth would reach.
-                int capacity = Math.Max(16, this.closed != 0 ? this.srcVertices.Length : this.srcVertices.Length * 2);
-                currentContour = new Contour((int)BitOperations.RoundUpToPowerOf2((uint)capacity));
+                points.Clear();
+                hasContour = true;
                 hasLastPoint = false;
             }
 
             if (command.Vertex())
             {
-                currentContour ??= new Contour(16);
+                hasContour = true;
 
                 // Accumulate returns vertices only from a completed join or cap
                 // buffer. Drain that buffer here instead of repeating command
@@ -562,7 +565,7 @@ public sealed class PolygonStroker
                     // Keep the same duplicate removal across joins and caps.
                     if (!hasLastPoint || vertex != lastPoint)
                     {
-                        currentContour.Add(vertex);
+                        points.Add(vertex);
                         lastPoint = vertex;
                         hasLastPoint = true;
                     }
@@ -573,38 +576,43 @@ public sealed class PolygonStroker
 
             if (command.EndPoly())
             {
-                if (currentContour is { Count: >= 3 })
+                if (hasContour && points.Length >= 3)
                 {
-                    AddStrokeContour(result, currentContour);
+                    AddStrokeContour(result, points.AsSpan());
                 }
 
-                currentContour = null;
+                points.Clear();
+                hasContour = false;
                 hasLastPoint = false;
             }
         }
 
-        if (currentContour is { Count: >= 3 })
+        if (hasContour && points.Length >= 3)
         {
-            AddStrokeContour(result, currentContour);
+            AddStrokeContour(result, points.AsSpan());
         }
+
+        points.Clear();
     }
 
     /// <summary>
-    /// Adds a generated contour after removing a repeated closing vertex.
+    /// Adds a finished stroke contour to the result, in an array of its exact length.
     /// </summary>
-    /// <param name="result">The destination polygon.</param>
-    /// <param name="contour">A generated contour with at least three stored vertices.</param>
-    private static void AddStrokeContour(Polygon result, Contour contour)
+    /// <param name="result">The polygon that receives the contour.</param>
+    /// <param name="points">The vertices of the contour, in order.</param>
+    private static void AddStrokeContour(Polygon result, ReadOnlySpan<Vertex> points)
     {
         // Closure belongs to the contour, not to a duplicate endpoint. Apply this
         // before emission so raw and cleaned output use the same representation.
-        if (contour[0] == contour[^1])
+        if (points[0] == points[^1])
         {
-            contour.RemoveVertexAt(contour.Count - 1);
+            points = points[..^1];
         }
 
-        if (contour.Count >= 3)
+        if (points.Length >= 3)
         {
+            Contour contour = new(points.Length);
+            contour.AddRange(points);
             result.Add(contour);
         }
     }
