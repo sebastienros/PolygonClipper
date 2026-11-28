@@ -79,6 +79,14 @@ internal struct ArrayBuilder<T>
     }
 
     /// <summary>
+    /// Gets the items of the array, from the first to the last added.
+    /// </summary>
+    /// <returns>The items; empty when nothing was added.</returns>
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public readonly ReadOnlySpan<T> AsSpan()
+        => this.data.AsSpan(0, this.size);
+
+    /// <summary>
     /// Adds the given item to the array.
     /// </summary>
     /// <param name="item">The item to add.</param>

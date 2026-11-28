@@ -42,6 +42,9 @@ public sealed class PolygonStroker
     // large arrays in thread-local pools for the lifetime of the thread.
     private const int MaxRetainedScratchBytes = 256 * 1024;
 
+    // The largest estimated contour capacity, in vertices, that FinishPath collects in contourVertices.
+    private const int MaxScratchContourCapacity = 256;
+
     private static readonly StrokeOptions DefaultStrokeOptions = new();
 
     [ThreadStatic]
@@ -50,6 +53,10 @@ public sealed class PolygonStroker
     // Scratch buffers reused across contours to keep per-call allocations down.
     private ArrayBuilder<Vertex> outVertices = new(1);
     private ArrayBuilder<StrokeVertexDistance> srcVertices = new(16);
+
+    // The vertices of a short stroke contour that FinishPath is building. The stroker reuses this buffer, so a short
+    // contour is copied once into an array of its exact length instead of growing a small list by doubling.
+    private ArrayBuilder<Vertex> contourVertices = new(16);
 
     // Streaming-state fields used by the Accumulate() state machine.
     private int closed;
@@ -479,7 +486,7 @@ public sealed class PolygonStroker
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private int GetRetainedScratchBytes()
-        => (this.outVertices.Capacity * Unsafe.SizeOf<Vertex>()) +
+        => ((this.outVertices.Capacity + this.contourVertices.Capacity) * Unsafe.SizeOf<Vertex>()) +
            (this.srcVertices.Capacity * Unsafe.SizeOf<StrokeVertexDistance>());
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -487,6 +494,7 @@ public sealed class PolygonStroker
     {
         this.outVertices.Clear();
         this.srcVertices.Clear();
+        this.contourVertices.Clear();
         this.closed = 0;
         this.outVertex = 0;
         this.prevStatus = Status.Initial;
@@ -527,6 +535,9 @@ public sealed class PolygonStroker
         Vertex lastPoint = default;
         bool hasLastPoint = false;
         Contour? currentContour = null;
+        bool inScratch = false;
+        ref ArrayBuilder<Vertex> points = ref this.contourVertices;
+        points.Clear();
         PathCommand command;
 
         while (!(command = this.Accumulate(ref current)).Stop())
@@ -534,23 +545,29 @@ public sealed class PolygonStroker
             if (command.MoveTo())
             {
                 // Start a new contour. Commit any previous contour that is already complete.
-                if (currentContour is { Count: >= 3 })
-                {
-                    AddStrokeContour(result, currentContour);
-                }
+                this.CommitContour(result, currentContour, inScratch);
 
                 // Each closed side visits the source once. An open outline visits
                 // both sides in one contour. Closure adds no repeated vertex here.
                 // Match the list's doubling sizes so extra join vertices do not
                 // overshoot the capacity that ordinary list growth would reach.
                 int capacity = Math.Max(16, this.closed != 0 ? this.srcVertices.Length : this.srcVertices.Length * 2);
-                currentContour = new Contour((int)BitOperations.RoundUpToPowerOf2((uint)capacity));
+
+                // A short contour is collected in the reused buffer and copied once at its exact length: its joins
+                // and caps would grow a small list by doubling. A long contour keeps the presized list, which round
+                // joins may still grow, because a buffer of its size is not retained between strokes.
+                inScratch = capacity <= MaxScratchContourCapacity;
+                currentContour = inScratch ? null : new Contour((int)BitOperations.RoundUpToPowerOf2((uint)capacity));
                 hasLastPoint = false;
             }
 
             if (command.Vertex())
             {
-                currentContour ??= new Contour(16);
+                // Vertices without a preceding move start a short contour in the buffer.
+                if (currentContour is null)
+                {
+                    inScratch = true;
+                }
 
                 // Accumulate returns vertices only from a completed join or cap
                 // buffer. Drain that buffer here instead of repeating command
@@ -562,7 +579,15 @@ public sealed class PolygonStroker
                     // Keep the same duplicate removal across joins and caps.
                     if (!hasLastPoint || vertex != lastPoint)
                     {
-                        currentContour.Add(vertex);
+                        if (inScratch)
+                        {
+                            points.Add(vertex);
+                        }
+                        else
+                        {
+                            currentContour!.Add(vertex);
+                        }
+
                         lastPoint = vertex;
                         hasLastPoint = true;
                     }
@@ -573,19 +598,37 @@ public sealed class PolygonStroker
 
             if (command.EndPoly())
             {
-                if (currentContour is { Count: >= 3 })
-                {
-                    AddStrokeContour(result, currentContour);
-                }
-
+                this.CommitContour(result, currentContour, inScratch);
                 currentContour = null;
+                inScratch = false;
                 hasLastPoint = false;
             }
         }
 
-        if (currentContour is { Count: >= 3 })
+        this.CommitContour(result, currentContour, inScratch);
+    }
+
+    /// <summary>
+    /// Adds the contour that <see cref="FinishPath"/> is building when it has at least three vertices, and empties
+    /// <see cref="contourVertices"/> for the next contour.
+    /// </summary>
+    /// <param name="result">The polygon that receives the contour.</param>
+    /// <param name="contour">The presized contour of a long outline, or <see langword="null"/>.</param>
+    /// <param name="inScratch">Whether the vertices are in <see cref="contourVertices"/> instead.</param>
+    private void CommitContour(Polygon result, Contour? contour, bool inScratch)
+    {
+        if (inScratch)
         {
-            AddStrokeContour(result, currentContour);
+            if (this.contourVertices.Length >= 3)
+            {
+                AddStrokeContour(result, this.contourVertices.AsSpan());
+            }
+
+            this.contourVertices.Clear();
+        }
+        else if (contour is { Count: >= 3 })
+        {
+            AddStrokeContour(result, contour);
         }
     }
 
@@ -605,6 +648,28 @@ public sealed class PolygonStroker
 
         if (contour.Count >= 3)
         {
+            result.Add(contour);
+        }
+    }
+
+    /// <summary>
+    /// Adds a finished stroke contour to the result, in an array of its exact length.
+    /// </summary>
+    /// <param name="result">The polygon that receives the contour.</param>
+    /// <param name="points">The vertices of the contour, in order.</param>
+    private static void AddStrokeContour(Polygon result, ReadOnlySpan<Vertex> points)
+    {
+        // Closure belongs to the contour, not to a duplicate endpoint. Apply this
+        // before emission so raw and cleaned output use the same representation.
+        if (points[0] == points[^1])
+        {
+            points = points[..^1];
+        }
+
+        if (points.Length >= 3)
+        {
+            Contour contour = new(points.Length);
+            contour.AddRange(points);
             result.Add(contour);
         }
     }
