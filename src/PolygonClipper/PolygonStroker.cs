@@ -558,16 +558,15 @@ public sealed class PolygonStroker
                 // joins may still grow, because a buffer of its size is not retained between strokes.
                 inScratch = capacity <= MaxScratchContourCapacity;
                 currentContour = inScratch ? null : new Contour((int)BitOperations.RoundUpToPowerOf2((uint)capacity));
-                points.Clear();
                 hasLastPoint = false;
             }
 
             if (command.Vertex())
             {
-                if (currentContour is null && !inScratch)
+                // Vertices without a preceding move start a short contour in the buffer.
+                if (currentContour is null)
                 {
                     inScratch = true;
-                    points.Clear();
                 }
 
                 // Accumulate returns vertices only from a completed join or cap
@@ -602,17 +601,16 @@ public sealed class PolygonStroker
                 this.CommitContour(result, currentContour, inScratch);
                 currentContour = null;
                 inScratch = false;
-                points.Clear();
                 hasLastPoint = false;
             }
         }
 
         this.CommitContour(result, currentContour, inScratch);
-        points.Clear();
     }
 
     /// <summary>
-    /// Adds the contour that <see cref="FinishPath"/> is building when it has at least three vertices.
+    /// Adds the contour that <see cref="FinishPath"/> is building when it has at least three vertices, and empties
+    /// <see cref="contourVertices"/> for the next contour.
     /// </summary>
     /// <param name="result">The polygon that receives the contour.</param>
     /// <param name="contour">The presized contour of a long outline, or <see langword="null"/>.</param>
@@ -625,6 +623,8 @@ public sealed class PolygonStroker
             {
                 AddStrokeContour(result, this.contourVertices.AsSpan());
             }
+
+            this.contourVertices.Clear();
         }
         else if (contour is { Count: >= 3 })
         {
